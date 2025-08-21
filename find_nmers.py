@@ -1,5 +1,6 @@
 import MDAnalysis as mda
 from MDAnalysis.lib.distances import capped_distance
+import math
 import numpy as np
 from itertools import combinations
 import networkx as nx
@@ -9,9 +10,34 @@ target = 6
 cutoff_ca = 8.5
 min_res_pairs = 4  # your setting
 
-def dense_enough(S: nx.Graph) -> bool:
-    degs = dict(S.degree())
-    return (min(degs.values()) >= 2) and (S.number_of_edges() >= 12)  # <-- note ()
+def dense_enough(S: nx.Graph, n: int, alpha: float = 0.65, min_k: int = 2, use_diameter: bool = True) -> bool:
+    """
+    Accept the component if:
+      - it has at least alpha * (n choose 2) edges (density threshold),
+      - every node has degree >= min_k (no chains),
+      - optional: graph diameter <= 2 (prevents stringy shapes, but allows rings).
+    """
+    if len(S) != n:
+        return False
+
+    # edge density threshold
+    e_required = math.ceil(alpha * (n * (n - 1) / 2.0))
+    if S.number_of_edges() < e_required:
+        return False
+
+    # minimum degree
+    if min(dict(S.degree()).values()) < min_k:
+        return False
+
+    if use_diameter:
+        try:
+            if nx.diameter(S) > 2:
+                return False
+        except nx.NetworkXError:
+            # should not happen (component is connected), but be safe
+            return False
+
+    return True
 
 def sizes_signature(G: nx.Graph):
     return sorted((len(c) for c in nx.connected_components(G)), reverse=True)
@@ -46,7 +72,7 @@ with mda.Writer("hexamers.xtc", u.atoms.n_atoms) as W:
 
         H_nodes = max(comps, key=len)         # the n-node component
         S = G.subgraph(H_nodes)
-        if not dense_enough(S):
+        if not dense_enough(S, target):
             continue
 
         # final sanity assertions (optional, helps catch logic slips)
@@ -86,7 +112,7 @@ with mda.Writer("hexamers.xtc", u.atoms.n_atoms) as W:
             continue
 
         S2 = G2.subgraph(max((set(c) for c in nx.connected_components(G2)), key=len))
-        if not dense_enough(S2):
+        if not dense_enough(S2, target):
             u.atoms.positions = old
             continue
 
