@@ -1,36 +1,20 @@
+#!/usr/bin/env python3
 """
-make_fel.py
------------
-Peptide-based Free Energy Landscape (FEL) utilities for oligomerization analysis.
+make_fel.py  (v1.1)
+-------------------
+Peptide-based FEL utilities with optional monomer chemical-potential correction.
 
-Modes
-=====
-A) 1D FEL: F(n) from existing cluster CSVs (no trajectory needed)
-   Input: cluster_results/cluster_sizes_per_frame.csv
-   Output: fel_F_of_n.(csv|png|pdf)
+New:
+- --mu_mode none|fraction|concentration
+  * fraction: F_corr(n) = F_sim(n) + n*kT*ln((N-n)/N)
+  * concentration: mu = kT*ln(c1/c0), c1=(N-n)/(N_A * V_L);  F_corr(n)=F_sim(n) - n*mu
+    Requires --N_total and either --box_nm3 or --volume_from_traj.
 
-B) 2D FEL: F(n, Rg) where Rg is the radius of gyration of the *largest* cluster per frame
-   (requires topology+trajectory; recomputes clusters peptide-wise).
-   Output: fel_F_of_n_Rg.(npy|png|pdf) and a CSV of bin centers + free energies.
+- --N_total, --box_nm3, --std_conc_M (default 1.0), --volume_from_traj
 
-Usage
-=====
-# Mode A (1D FEL from CSV; fast)
-python make_clust_fel.py --indir results_cluster --temperature 300
-
-# Mode B (2D FEL with Rg; recompute clusters)
-python make_fel.py \
-  --top topol.tpr --traj traj.xtc --groupby auto \
-  --selection "protein and name CA" \
-  --cutoff 0.6 --min_contacts 3 --stride 10 --pbc \
-  --temperature 300 \
-  --fel2d --outdir fel_results
-
-Notes
-=====
-- FEL computed as F = -k_B T ln P + C (C chosen so min(F)=0).
-- Add a small pseudocount to avoid log(0).
-- Units: k_B in kJ/(mol*K), so F is in kJ/mol.
+Modes remain:
+A) 1D FEL over n from cluster_sizes_per_frame.csv
+B) 2D FEL over (n, Rg) with --fel2d (no mu correction applied to 2D map by default).
 """
 
 import argparse
@@ -41,13 +25,25 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-kB = 0.008314462618  # kJ/(mol*K)
+#kB = 0.008314462618  # kJ/(mol*K)
+kB = 0.001985875  # kcal/(mol*K)
+N_A = 6.02214076e23  # 1/mol
+NM3_TO_L = 1e-24     # 1 nm^3 = 1e-24 L
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compute peptide-based FELs over oligomer size (and optional Rg).")
     p.add_argument("--indir", default="cluster_results", help="Directory with cluster CSVs (Mode A)")
     p.add_argument("--temperature", type=float, default=300.0, help="Temperature in K (default 300)")
     p.add_argument("--outdir", default=None, help="Output directory (defaults to --indir)")
+
+    # Chemical potential correction options (1D FEL only)
+    p.add_argument("--mu_mode", choices=["none","fraction","concentration"], default="none",
+                   help="Apply monomer chemical-potential correction to 1D FEL (default: none)")
+    p.add_argument("--N_total", type=int, default=None, help="Total number of peptides N (required for mu correction)")
+    p.add_argument("--box_nm3", type=float, default=None, help="Simulation box volume in nm^3 (for mu=concentration)")
+    p.add_argument("--std_conc_M", type=float, default=1.0, help="Standard-state concentration c0 in M (default 1.0)")
+    p.add_argument("--volume_from_traj", action="store_true",
+                   help="Estimate average box volume from trajectory (requires --top/--traj)")
 
     # Mode B (trajectory-based 2D FEL)
     p.add_argument("--fel2d", action="store_true", help="Enable 2D FEL over (n, Rg_largest) [requires traj]")
@@ -71,7 +67,29 @@ def parse_args():
 
 # ------------------ Mode A: FEL over n from CSV ------------------
 
-def fel_1d_from_csv(indir, T, outdir=None, pseudocount=1e-6):
+def _estimate_volume_from_traj(top, traj, stride=50):
+    try:
+        import MDAnalysis as mda
+    except Exception as e:
+        raise RuntimeError("Need MDAnalysis installed for --volume_from_traj") from e
+    u = mda.Universe(top, traj)
+    vols = []
+    for ts in u.trajectory[::stride]:
+        # ts.dimensions[:3] are triclinic vectors' lengths; volume = a*b*c*sqrt(1 + 2cosαcosβcosγ - cos^2α - cos^2β - cos^2γ)
+        # MDAnalysis provides volume as ts.volume (nm^3) when available
+        if getattr(ts, "volume", None) is not None:
+            vols.append(float(ts.volume))
+        else:
+            # Fallback to orthorhombic approximation
+            a, b, c = ts.dimensions[:3]
+            vols.append(float(a*b*c))
+    if not vols:
+        raise RuntimeError("Could not read volume from trajectory.")
+    return float(np.mean(vols))
+
+def fel_1d_from_csv(indir, T, outdir=None, pseudocount=1e-6,
+                    mu_mode="none", N_total=None, box_nm3=None, std_conc_M=1.0,
+                    volume_from_traj=False, top=None, traj=None):
     indir = Path(indir)
     outdir = Path(outdir) if outdir else indir
     outdir.mkdir(parents=True, exist_ok=True)
@@ -84,32 +102,82 @@ def fel_1d_from_csv(indir, T, outdir=None, pseudocount=1e-6):
         raise ValueError("cluster_sizes_per_frame.csv is missing 'largest_cluster'. Update your analysis script.")
 
     n_vals = df["largest_cluster"].values.astype(int)
-    # Build histogram over n >=1
     n_max = int(max(n_vals)) if len(n_vals)>0 else 1
-    bins = np.arange(0.5, n_max+1.5, 1.0)  # centers at 1,2,...,n_max
-    hist, edges = np.histogram(n_vals, bins=bins, density=False)
+    centers = np.arange(1, n_max+1, 1)
+    bins = np.arange(0.5, n_max+1.5, 1.0)
+    hist, _ = np.histogram(n_vals, bins=bins, density=False)
     counts = hist.astype(float)
     P = (counts + pseudocount) / (counts.sum() + pseudocount*len(counts))
+    Fsim = -kB * T * np.log(P)
+    Fsim -= np.nanmin(Fsim)
 
-    F = -kB * T * np.log(P)
-    F -= np.nanmin(F)  # set minimum to 0
-    centers = np.arange(1, n_max+1, 1)
-    out = pd.DataFrame({"n": centers, "prob": P, "F_kJmol": F})
+    # --- Chemical potential correction (optional) ---
+    Fcorr = Fsim.copy()
+    extra_note = ""
+    if mu_mode != "none":
+        if N_total is None:
+            raise ValueError("--N_total is required for --mu_mode fraction|concentration")
+
+        if mu_mode == "fraction":
+            # F_corr(n) = F_sim(n) + n*kT*ln((N-n)/N)
+            frac = (N_total - centers) / float(N_total)
+            # avoid log(0) at n=N
+            frac = np.clip(frac, 1e-12, None)
+            Fcorr = Fsim + kB*T * (centers * np.log(frac))
+            extra_note = "Applied fraction-based mu correction: F_corr(n) = F_sim(n) + n kT ln((N-n)/N)."
+
+        elif mu_mode == "concentration":
+            # Need a volume in liters
+            if volume_from_traj:
+                if top is None or traj is None:
+                    raise ValueError("--volume_from_traj requires --top and --traj")
+                V_nm3 = _estimate_volume_from_traj(top, traj)
+            else:
+                if box_nm3 is None:
+                    raise ValueError("--box_nm3 (nm^3) or --volume_from_traj must be provided for mu=concentration")
+                V_nm3 = box_nm3
+            V_L = V_nm3 * NM3_TO_L
+            # c1(n) in mol/L
+            c1 = (N_total - centers) / (N_A * V_L)
+            c1 = np.clip(c1, 1e-30, None)  # avoid log(0)
+            mu = kB*T * np.log(c1 / float(std_conc_M))
+            Fcorr = Fsim - centers * mu
+            extra_note = f"Applied concentration-based mu correction with N={N_total}, V={V_nm3:.3e} nm^3, c0={std_conc_M} M."
+
+        # Shift so min=0 for readability
+        Fcorr -= np.nanmin(Fcorr)
+
+    out = pd.DataFrame({"n": centers, "prob": P, "F_sim_kJmol": Fsim, "F_corr_kJmol": Fcorr})
     out.to_csv(outdir / "fel_F_of_n.csv", index=False)
 
-    # Plot
+    # Plot both (if corrected, show both curves)
     plt.figure(figsize=(6,4))
-    plt.plot(centers, F, marker="o")
+    lbl_sim = "F_sim(n)"
+    plt.plot(centers, Fsim, marker="o", linestyle="-", label=lbl_sim)
+    if mu_mode != "none":
+        plt.plot(centers, Fcorr, marker="s", linestyle="--", label="F_corr(n)")
+        plt.legend()
     plt.xlabel("Largest cluster size, n")
-    plt.ylabel("F(n) [kJ/mol]")
-    plt.title(f"FEL over n (T={T:.0f} K)")
+    plt.ylabel("F [kcal/mol]")
+    title = f"FEL over n (T={T:.0f} K)"
+    if mu_mode != "none":
+        title += f"  [{mu_mode} μ-correction]"
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(outdir / "fel_F_of_n.png", dpi=300)
     plt.savefig(outdir / "fel_F_of_n.pdf")
     plt.close()
-    print("Wrote 1D FEL to:", outdir)
 
-# ------------------ Mode B helpers: clustering + Rg ---------------
+    # Write a small README note
+    with open(outdir / "fel_README.txt", "w") as f:
+        f.write("FEL over n computed as F = -kT ln P + C; minimum set to 0.\n")
+        if mu_mode != "none":
+            f.write(extra_note + "\n")
+
+# ------------------ Mode B: 2D FEL remains the same ---------------
+
+# (Import the previous v1.0 2D code by reading from the same file, to avoid duplication here.)
+# For brevity in this snippet, we just re-define the same functions from the prior version.
 
 def _unique_nonempty(arr):
     vals = []
@@ -118,7 +186,6 @@ def _unique_nonempty(arr):
             if v.strip() == "":
                 continue
         vals.append(v)
-    # preserve order
     seen = set()
     keep = []
     for v in vals:
@@ -146,7 +213,6 @@ def _build_groups(u, selection, groupby):
                 gs.append(ag)
         return gs
 
-    # explicit choice
     if groupby in ("segid","chainID","molnum"):
         keys = getattr(sel.atoms, groupby+"s")
         keys = _unique_nonempty(keys)
@@ -155,7 +221,6 @@ def _build_groups(u, selection, groupby):
             return gs
         raise ValueError(f"Found {len(gs)} group(s) with {groupby}")
 
-    # auto: segid -> chainID -> molnum -> residue reset
     try:
         keys = _unique_nonempty(sel.atoms.segids)
         gs = groups_from("segid", keys)
@@ -178,7 +243,6 @@ def _build_groups(u, selection, groupby):
     except Exception:
         pass
 
-    # residue reset (fallback): split CA atoms where resid drops significantly
     ca = sel.select_atoms("name CA") if sel.select_atoms("name CA").n_atoms>0 else sel
     resids = ca.resids
     breaks = [0]
@@ -226,14 +290,9 @@ def _connected_components(n, edges):
     return list(groups.values())
 
 def _rg(ag, box=None):
-    # Simple radius of gyration around the center of mass; ignore masses (uniform).
     coords = ag.positions
     com = coords.mean(axis=0)
     diffs = coords - com
-    if box is not None:
-        # unwrap minimum-image relative to COM for triclinic boxes
-        # approximate: MDAnalysis has triclinic unwrap in distances; here we skip due to complexity.
-        pass
     rg2 = (diffs*diffs).sum(axis=1).mean()
     return float(np.sqrt(rg2))
 
@@ -253,7 +312,6 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
     groups = _build_groups(u, selection, groupby)
     n_groups = len(groups)
 
-    # Determine cutoff units (heuristic like before): assume traj coords in nm if box length < 50
     cutoff_internal = cutoff
     inferred = None
     for ts in u.trajectory[:: max(1, len(u.trajectory)//5) ]:
@@ -261,13 +319,11 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
             L = float(ts.dimensions[0])
             inferred = "angstrom" if L > 50 else "nm"
             break
-    # If coords are Angstroms but cutoff provided in nm, scale
     if inferred == "angstrom":
         cutoff_internal = cutoff * 10.0
 
     Ns = []
     Rgs = []
-
     start_ps = start_ns*1000.0 if start_ns is not None else None
     stop_ps  = stop_ns*1000.0 if stop_ns  is not None else None
 
@@ -278,7 +334,6 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
         if stop_ps is not None and t_ps is not None and t_ps > stop_ps:
             break
 
-        # Build edges
         edges = []
         box = ts.dimensions if pbc else None
         for i in range(n_groups-1):
@@ -292,10 +347,7 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
         comps = _connected_components(n_groups, edges)
         sizes = [len(c) for c in comps]
         if not sizes:
-            Ns.append(0)
-            Rgs.append(np.nan)
-            continue
-        # largest component
+            Ns.append(0); Rgs.append(np.nan); continue
         imax = int(np.argmax(sizes))
         largest_nodes = comps[imax]
         ag = groups[largest_nodes[0]]
@@ -307,19 +359,13 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
         Rgs.append(float(rg))
         Ns.append(int(sizes[imax]))
 
-    # 2D histogram over (n, Rg)
     n_max = max(Ns) if Ns else 1
-    n_bins = np.arange(0.5, n_max+1.5, 1.0)  # integer bins
-    if isinstance(bins_n, int):
-        # ensure we cover full integer range regardless of bins_n
-        n_bins = np.arange(0.5, n_max+1.5, 1.0)
+    n_bins = np.arange(0.5, n_max+1.5, 1.0)
     rg_min = np.nanmin(Rgs) if len(Rgs)>0 else 0.0
     rg_max = np.nanmax(Rgs) if len(Rgs)>0 else 1.0
-    # safe margins
     rg_pad = 0.05*(rg_max - rg_min + 1e-12)
     rg_edges = np.linspace(rg_min - rg_pad, rg_max + rg_pad, bins_Rg+1)
 
-    # Mask NaNs
     Ns_arr = np.array(Ns)
     Rg_arr = np.array(Rgs)
     mask = np.isfinite(Ns_arr) & np.isfinite(Rg_arr) & (Ns_arr>0)
@@ -329,10 +375,8 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
     F = -kB * T * np.log(P)
     F -= np.nanmin(F)
 
-    # Save CSV with bin centers
     n_centers = 0.5*(n_edges[:-1] + n_edges[1:])
     rg_centers = 0.5*(rg_edges[:-1] + rg_edges[1:])
-    # Flatten grid to CSV
     rows = []
     for i, n_c in enumerate(n_centers):
         for j, rg_c in enumerate(rg_centers):
@@ -341,19 +385,15 @@ def fel_2d_recompute(top, traj, selection, groupby, cutoff, min_contacts, stride
     out_csv = outdir / "fel_F_of_n_Rg.csv"
     fel2d_df.to_csv(out_csv, index=False)
 
-    # Save numpy array too
     np.save(outdir / "fel_F_of_n_Rg.npy", F)
 
-    # Plot as heatmap
     plt.figure(figsize=(6,5))
     extent = [rg_edges[0], rg_edges[-1], n_edges[0], n_edges[-1]]
-    # imshow expects [xmin,xmax,ymin,ymax]; origin lower to have small n at bottom
     plt.imshow(F.T, origin="lower", aspect="auto", extent=extent)
     plt.xlabel(f"Rg (largest cluster) [{Rg_unit}]")
     plt.ylabel("Cluster size, n (largest)")
     plt.title(f"F(n, Rg) at T={T:.0f} K")
-    cbar = plt.colorbar()
-    cbar.set_label("F [kJ/mol]")
+    cbar = plt.colorbar(); cbar.set_label("F [kcal/mol]")
     plt.tight_layout()
     plt.savefig(outdir / "fel_F_of_n_Rg.png", dpi=300)
     plt.savefig(outdir / "fel_F_of_n_Rg.pdf")
@@ -373,7 +413,11 @@ def main():
                          args.bins_n, args.bins_Rg, args.Rg_unit,
                          outdir, args.pseudocount)
     else:
-        fel_1d_from_csv(args.indir, args.temperature, outdir, args.pseudocount)
+        fel_1d_from_csv(args.indir, args.temperature, outdir, args.pseudocount,
+                        mu_mode=args.mu_mode, N_total=args.N_total, box_nm3=args.box_nm3,
+                        std_conc_M=args.std_conc_M, volume_from_traj=args.volume_from_traj,
+                        top=args.top, traj=args.traj)
 
 if __name__ == "__main__":
     main()
+
